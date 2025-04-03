@@ -1,8 +1,5 @@
-# Tampermonkey-DirScanner-Pro
-Tampermonkey DirScanner Pro是一款功能强大的目录扫描工具，基于油猴脚本开发，旨在为安全测试人员和开发者提供便捷的目录扫描功能。支持GET&amp;POST请求简单的发送poc，以及备忘录功能。
-
-# 🎯 DirScan：强大的目录扫描工具
-一款功能强大的目录扫描工具，基于油猴脚本开发，旨在为安全测试人员和开发者提供便捷的目录扫描功能。它参考了 dirsearch 工具进行优化，具备多项实用功能和良好的用户体验。🚀
+# 🎯 Tampermonkey-DirScanner-Pro：强大的目录扫描工具
+Tampermonkey DirScanner Pro是一款功能强大的目录扫描工具，基于油猴脚本开发，旨在为安全测试人员和开发者提供便捷的目录扫描功能。支持GET&amp;POST请求简单的发送poc，以及备忘录功能;具备多项实用功能和良好的用户体验。🚀
 ## 🌟 功能特性
 基础扫描功能
 支持对指定 URL 进行目录扫描，可自定义字典路径，支持 GET 和 POST 请求方式。能自动填充当前页面 URL，方便快速开始扫描。🌐
