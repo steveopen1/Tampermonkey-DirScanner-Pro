@@ -1,0 +1,1848 @@
+// ==UserScript==
+// @name         Tampermonkey DirScanner Pro
+// @namespace    http://tampermonkey.net/
+// @version      2.4
+// @description  简单的油猴目录扫描插件
+// @author       You
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// ==/UserScript==
+
+(function() {    'use strict';
+
+    // 仅在顶层窗口运行脚本
+    if (window !== window.top) {
+        return;
+    }
+
+    // 创建Web Worker用于后台扫描
+    const createScanWorker = () => {
+        const workerCode = `
+            self.onmessage = function(e) {
+                const { urls, method, headers, data } = e.data;
+                const results = [];
+
+                urls.forEach((url, index) => {
+                    GM_xmlhttpRequest({
+                        method: method,
+                        url: url,
+                        headers: headers,
+                        data: data,
+                        onload: function(response) {
+                            const responseLength = response.responseText ? response.responseText.length : 0;
+                            results.push({
+                                index: index + 1,
+                                url: url,
+                                status: response.status,
+                                length: responseLength,
+                                responseText: response.responseText || ''
+                            });
+                            self.postMessage({ type: 'progress', data: results });
+                        },
+                        onerror: function(error) {
+                            results.push({
+                                index: index + 1,
+                                url: url,
+                                status: '请求失败',
+                                length: '',
+                                responseText: '',
+                                errorDetails: error.message || '未知错误'
+                            });
+                            self.postMessage({ type: 'progress', data: results });
+                        }
+                    });
+                });
+            };
+        `;
+
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        return new Worker(URL.createObjectURL(blob));
+    };
+
+    // 从HTML响应中提取<title>内容
+    function getTitleFromResponse(html) {
+        if (!html) return '';
+        const titleMatch = html.match(/<title>([\s\S]*?)<\/title>/i);
+        return titleMatch ? titleMatch[1].trim() : '';
+    }
+
+    // 提取公共样式设置函数
+    function setElementStyles(element, styles) {
+        for (const [property, value] of Object.entries(styles)) {
+            element.style[property] = value;
+        }
+    }
+
+    // 创建开关按钮
+    const toggleBtn = document.createElement('button');
+    toggleBtn.textContent = '展开扫描工具';
+    setElementStyles(toggleBtn, {
+        position: 'fixed',
+        top: '10px',
+        right: '10px',
+        zIndex: '9999',
+        padding: '10px',
+        border: 'none',
+        borderRadius: '50%',
+        backgroundColor: 'rgba(0, 0, 0, 0.3)',
+        backdropFilter: 'blur(10px)',
+        color: '#0F0',
+        cursor: 'pointer',
+        boxShadow: '0 0 10px #0F0',
+        fontSize: '12px',
+        fontWeight: 'bold',
+        width: '40px',
+        height: '40px',
+        textAlign: 'center',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundImage: 'url("data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><circle cx=\"20\" cy=\"20\" r=\"18\" fill=\"none\" stroke=\"#0F0\" stroke-width=\"2\" stroke-dasharray=\"4 4\"/></svg>")'
+    });
+    document.body.appendChild(toggleBtn);
+
+    // 创建全屏结果面板按钮
+    const fullscreenBtn = document.createElement('button');
+    fullscreenBtn.textContent = '全屏结果';
+    setElementStyles(fullscreenBtn, {
+        position: 'fixed',
+        bottom: '20px',
+        right: '20px',
+        zIndex: '100000',
+        padding: '10px 15px',
+        backgroundColor: '#0F0',
+        border: 'none',
+        borderRadius: '50%',
+        cursor: 'pointer',
+        boxShadow: '0 0 10px #0F0'
+    });
+    document.body.appendChild(fullscreenBtn);
+
+    // 创建全屏结果面板
+    const resultPanel = document.createElement('div');
+    resultPanel.id = 'result-panel';
+    setElementStyles(resultPanel, {
+        display: 'none',
+        position: 'fixed',
+        width: '100%',
+        height: '80vh',
+        top: '0',
+        left: '0',
+        backgroundColor: 'rgba(0,15,0,0.95)',
+        backdropFilter: 'blur(15px)',
+        border: '2px solid #0F0',
+        borderRadius: '0 0 8px 8px',
+        zIndex: '100000',
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        minHeight: '300px',
+        scrollBehavior: 'smooth',
+        '-webkit-overflow-scrolling': 'touch'
+    });
+    document.body.appendChild(resultPanel);
+
+    // 默认隐藏全屏按钮
+    fullscreenBtn.style.display = 'none';
+
+    // 在扫描结果处理函数中显示全屏按钮
+    function showFullscreenButton() {
+        fullscreenBtn.style.display = 'block';
+        fullscreenBtn.style.zIndex = '100000';
+        if (window.scanResults) {
+            updateResultPanel(window.scanResults);
+            resultPanel.style.display = 'block';
+            const rect = resultPanel.getBoundingClientRect();
+            const adjusted = adjustPosition(rect);
+            resultPanel.style.left = adjusted.left + 'px';
+            resultPanel.style.top = adjusted.top + 'px';
+        }
+    }
+
+    // 全屏按钮点击事件
+    fullscreenBtn.addEventListener('click', function() {
+        if (resultPanel.style.display === 'none') {
+            resultPanel.style.display = 'block';
+            const rect = resultPanel.getBoundingClientRect();
+            const adjusted = adjustPosition(rect);
+            resultPanel.style.left = adjusted.left + 'px';
+            resultPanel.style.top = adjusted.top + 'px';
+            // 更新结果面板内容
+            if (window.scanResults) {
+                updateResultPanel(window.scanResults);
+            }
+        } else {
+            resultPanel.style.display = 'none';
+        }
+    });
+
+    // 增强版碰撞检测算法
+    function adjustPosition(panelRect) {
+        const screenWidth = window.innerWidth;
+        const screenHeight = window.innerHeight;
+        const memoPanel = document.getElementById('memo-panel');
+        const scanPanel = document.getElementById('scan-container');
+        
+        // 获取所有相关面板的位置
+        let memoRect = null;
+        let scanRect = null;
+        
+        if (memoPanel && memoPanel.style.display !== 'none') {
+            memoRect = memoPanel.getBoundingClientRect();
+        }
+        if (scanPanel && scanPanel.style.display !== 'none') {
+            scanRect = scanPanel.getBoundingClientRect();
+        }
+
+        // 边界检测
+        if (panelRect.right > screenWidth) {
+            panelRect.left -= (panelRect.right - screenWidth + 20);
+        }
+        if (panelRect.left < 0) {
+            panelRect.left = 20;
+        }
+        if (panelRect.bottom > screenHeight) {
+            panelRect.top -= (panelRect.bottom - screenHeight + 20);
+        }
+        if (panelRect.top < 0) {
+            panelRect.top = 20;
+        }
+
+        // 与备忘录面板的碰撞检测
+        if (memoRect) {
+            // 检查水平方向重叠
+            const horizontalOverlap = panelRect.right > memoRect.left && panelRect.left < memoRect.right;
+            // 检查垂直方向重叠
+            const verticalOverlap = panelRect.bottom > memoRect.top && panelRect.top < memoRect.bottom;
+            
+            if (horizontalOverlap && verticalOverlap) {
+                // 计算可用空间
+                const spaceAbove = memoRect.top;
+                const spaceBelow = screenHeight - memoRect.bottom;
+                const spaceLeft = memoRect.left;
+                const spaceRight = screenWidth - memoRect.right;
+                
+                // 根据可用空间选择最佳调整方向
+                if (spaceAbove > panelRect.height + 20) {
+                    panelRect.top = memoRect.top - panelRect.height - 20;
+                } else if (spaceBelow > panelRect.height + 20) {
+                    panelRect.top = memoRect.bottom + 20;
+                } else if (spaceLeft > panelRect.width + 20) {
+                    panelRect.left = memoRect.left - panelRect.width - 20;
+                } else if (spaceRight > panelRect.width + 20) {
+                    panelRect.left = memoRect.right + 20;
+                } else {
+                    // 如果空间不足，默认放在屏幕右下角
+                    panelRect.left = screenWidth - panelRect.width - 20;
+                    panelRect.top = screenHeight - panelRect.height - 20;
+                }
+            }
+        }
+
+        // 与扫描控制面板的碰撞检测
+        if (scanRect) {
+            const horizontalOverlap = panelRect.right > scanRect.left && panelRect.left < scanRect.right;
+            const verticalOverlap = panelRect.bottom > scanRect.top && panelRect.top < scanRect.bottom;
+            
+            if (horizontalOverlap && verticalOverlap) {
+                // 优先向右移动
+                if (screenWidth - scanRect.right > panelRect.width + 20) {
+                    panelRect.left = scanRect.right + 20;
+                } else {
+                    // 如果右侧空间不足，向左移动
+                    panelRect.left = scanRect.left - panelRect.width - 20;
+                }
+            }
+        }
+
+        return panelRect;
+    }
+
+    // 窗口大小变化时重新计算位置
+    window.addEventListener('resize', function() {
+        const panel = document.getElementById('result-panel');
+        if (panel.style.display !== 'none') {
+            const rect = panel.getBoundingClientRect();
+            const adjusted = adjustPosition(rect);
+            panel.style.left = adjusted.left + 'px';
+            panel.style.top = adjusted.top + 'px';
+        }
+    });
+
+    // 双模式展示布局
+    resultPanel.innerHTML = `
+        <div class="result-panel" style="display: grid;
+            grid-template:
+              'header    header'    60px
+              'sidebar   main'      1fr
+              'statusbar statusbar' 30px
+             / 250px    1fr;
+            max-height: 80vh;
+            height: 100%;
+            overflow: auto;">
+            <div style="grid-area: header; border-bottom: 1px solid #0F03;">
+              <h3 style="margin: 0; padding: 15px;">扫描结果</h3>
+              <button id="toggle-view" style="position: absolute; right: 15px; top: 15px;">切换视图</button>
+            </div>
+            <div style="grid-area: sidebar; border-right: 1px solid #0F03;">
+                <div style="padding: 10px;">
+                    <input type="text" id="search-url" placeholder="搜索URL" style="width: 100%; margin-bottom: 10px; padding: 5px; background: rgba(255,255,255,0.1); border: 1px solid #0F0; color: #0F0;">
+                    <input type="text" id="search-status" placeholder="搜索状态码" style="width: 100%; padding: 5px; background: rgba(255,255,255,0.1); border: 1px solid #0F0; color: #0F0;">
+                </div>
+            </div>
+            <div style="grid-area: main; overflow: auto;">
+              <div id="table-view" class="data-table" style="display: block; width: 100%; border-collapse: collapse; font-family: monospace; font-size: 14px; max-height: calc(80vh - 90px); overflow-y: auto;"></div>
+              <div id="card-view" style="display: none; padding: 10px; background: rgba(0, 0, 0, 0.7); border-radius: 8px; margin: 5px; max-height: calc(80vh - 90px); overflow-y: auto;"></div>
+            </div>
+            <div style="grid-area: statusbar; border-top: 1px solid #0F03;">状态栏</div>
+          </div>
+    `;
+
+    // 创建扫描工具容器
+    const scanContainer = document.createElement('div');
+    setElementStyles(scanContainer, {
+        position: 'fixed',
+        top: '50px',
+        right: '10px',
+        width: '450px',
+        maxWidth: 'calc(100% - 20px)',
+        maxHeight: 'calc(100% - 60px)',
+        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+        backdropFilter: 'blur(15px)',
+        border: '1px solid rgba(255, 255, 255, 0.1)',
+        padding: '25px',
+        zIndex: '9999',
+        display: 'none',
+        borderRadius: '12px',
+        boxShadow: '0 8px 20px rgba(0, 0, 0, 0.3)',
+        overflowY: 'auto',
+        fontFamily: 'Segoe UI, Roboto, Oxygen, Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif',
+        color: '#7CFC00',
+        lineHeight: '1.6'
+    });
+
+    // 窗口大小变化时调整容器大小
+    window.addEventListener('resize', function() {
+        if (!resultPanel.classList.contains('fullscreen')) {
+            scanContainer.style.width = Math.min(800, window.innerWidth - 40) + 'px';
+            scanContainer.style.height = Math.min(600, window.innerHeight - 40) + 'px';
+        }
+    });
+
+    // 初始设置大小
+    scanContainer.style.width = Math.min(800, window.innerWidth - 40) + 'px';
+    scanContainer.style.height = Math.min(600, window.innerHeight - 40) + 'px';
+
+    document.body.appendChild(scanContainer);
+
+function applyTheme(theme) {
+  const colors = {
+    matrix: {
+        main: '#00FF7F',
+        bg: 'linear-gradient(135deg, rgba(0, 100, 0, 0.8), rgba(0, 150, 0, 0.9))',
+        shadow: '0 0 20px #00FF00, 0 0 30px #00FF7F',
+        buttonBg: 'rgba(0, 0, 0, 0.3)',
+        buttonHoverBg: 'rgba(0, 255, 127, 0.2)',
+        backdropFilter: 'blur(10px)',
+        buttonText: '#00FF7F'
+    },
+    classic: {
+        main: '#FFFFFF',
+        bg: 'rgba(0, 0, 0, 0.8)',
+        shadow: '0 2px 5px #666',
+        buttonBg: 'rgba(255, 255, 255, 0.2)',
+        buttonHoverBg: 'rgba(255, 255, 255, 0.3)',
+        backdropFilter: 'blur(10px)'
+    },
+    neon: {
+        main: '#FF00FF',
+        bg: 'linear-gradient(135deg, rgba(120, 0, 255, 0.8), rgba(255, 0, 255, 0.9))',
+        shadow: '0 0 25px #FF00FF, 0 0 35px #FFFF00',
+        buttonBg: 'rgba(255, 255, 255, 0.3)',
+        buttonHoverBg: 'rgba(255, 0, 255, 0.2)',
+        buttonText: '#FF00FF',
+        backdropFilter: 'blur(10px)'
+    },
+
+
+  };
+
+  const themeColors = colors[theme] || colors.matrix;
+
+  // 应用主题样式
+  scanContainer.style.transition = 'background-color 0.3s, color 0.3s';
+  scanContainer.style.backgroundColor = themeColors.bg;
+  scanContainer.style.boxShadow = themeColors.shadow;
+  scanContainer.style.color = themeColors.main;
+
+  // 更新所有按钮和输入框样式
+  const buttons = scanContainer.querySelectorAll('button');
+  buttons.forEach(btn => {
+      btn.style.backgroundColor = themeColors.buttonBg;
+      btn.style.color = themeColors.main;
+      btn.style.transition = 'background-color 0.3s';
+
+      btn.addEventListener('mouseenter', () => {
+          btn.style.backgroundColor = themeColors.buttonHoverBg;
+      });
+      btn.addEventListener('mouseleave', () => {
+          btn.style.backgroundColor = themeColors.buttonBg;
+      });
+  });
+
+  const inputs = scanContainer.querySelectorAll('input, textarea, select');
+    inputs.forEach(input => {
+        input.style.borderColor = themeColors.main;
+        input.style.color = themeColors.textColor || themeColors.main;
+        input.style.backgroundColor = theme === 'blueWhite' ? 'rgba(255, 255, 255, 0.8)' : 'rgba(255, 255, 255, 0.1)';
+        input.style.borderRadius = '5px';
+        input.style.padding = '8px';
+    });
+}
+
+function showThemeNotification(themeName) {
+  const notification = document.createElement('div');
+  notification.textContent = `[${themeName}] 主题已激活`;
+  notification.style.position = 'fixed';
+  notification.style.bottom = '20px';
+  notification.style.right = '20px';
+  notification.style.padding = '10px 15px';
+  notification.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+  notification.style.color = '#FFFFFF';
+  notification.style.borderRadius = '4px';
+  notification.style.zIndex = '10000';
+  notification.style.transition = 'opacity 1s';
+
+  document.body.appendChild(notification);
+
+  setTimeout(() => {
+    notification.style.opacity = '0';
+    setTimeout(() => notification.remove(), 1000);
+  }, 2000);
+}
+
+function showResponsePopup(url, content) {
+  const popup = document.getElementById('response-popup');
+  popup.style.display = 'block';
+
+  // 添加内容截断和展开/折叠功能
+  const truncatedContent = content.length > 500 ? content.substring(0, 500) + '...' : content;
+  const isTruncated = content.length > 500;
+
+  const pre = popup.querySelector('pre');
+  pre.textContent = truncatedContent;
+
+  // 添加展开/折叠按钮
+  if (isTruncated) {
+    const toggleBtn = document.createElement('button');
+    toggleBtn.textContent = '展开全部';
+    toggleBtn.style.margin = '10px 0';
+    toggleBtn.style.padding = '5px 10px';
+    toggleBtn.style.backgroundColor = '#0F0';
+    toggleBtn.style.border = 'none';
+    toggleBtn.style.borderRadius = '4px';
+    toggleBtn.style.cursor = 'pointer';
+
+    toggleBtn.onclick = function() {
+      if (pre.textContent === truncatedContent) {
+        pre.textContent = content;
+        toggleBtn.textContent = '折叠内容';
+      } else {
+        pre.textContent = truncatedContent;
+        toggleBtn.textContent = '展开全部';
+      }
+    };
+
+    popup.appendChild(toggleBtn);
+  }
+
+  // 添加关闭按钮事件监听
+  popup.querySelector('button').onclick = function() {
+    popup.style.display = 'none';
+  };
+
+  // 添加ESC键关闭功能
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+      popup.style.display = 'none';
+    }
+  });
+}
+
+    // 创建拖动条
+    const dragBar = document.createElement('div');
+    dragBar.style.height = '40px';
+    // 提取重复的样式设置到函数中
+    function setBackgroundColor(element, color) {
+        element.style.backgroundColor = color;
+    }
+    function setBoxShadow(element, shadow) {
+        element.style.boxShadow = shadow;
+    }
+    dragBar.style.backdropFilter = 'blur(15px)';
+    dragBar.style.cursor = 'move';
+    dragBar.style.borderTopLeftRadius = '12px';
+    dragBar.style.borderTopRightRadius = '12px';
+    dragBar.style.margin = '-25px -25px 25px -25px';
+    dragBar.style.display = 'flex';
+    dragBar.style.alignItems = 'center';
+    dragBar.style.justifyContent = 'space-between';
+    dragBar.style.fontWeight = 'bold';
+    dragBar.style.fontSize = '16px';
+    dragBar.style.letterSpacing = '1px';
+
+    const dragText = document.createElement('span');
+    dragText.textContent = '拖动调整位置';
+    dragText.style.marginLeft = '15px';
+    dragText.style.marginLeft = '15px';
+    dragBar.appendChild(dragText);
+
+    // 添加主题切换下拉菜单
+    const themeSelect = document.createElement('select');
+    themeSelect.style.marginRight = '15px';
+    themeSelect.style.background = 'rgba(0, 0, 0, 0.5)';
+    themeSelect.style.color = '#7CFC00';
+    themeSelect.style.border = '1px solid rgba(255, 255, 255, 0.1)';
+    themeSelect.style.borderRadius = '4px';
+    themeSelect.style.padding = '4px 8px';
+
+    const themes = [
+      {name: '矩阵绿', value: 'matrix'},
+      {name: '霓虹紫', value: 'neon'},
+      {name: '经典黑', value: 'classic'},
+
+    ];
+
+    themes.forEach(theme => {
+      const option = document.createElement('option');
+      option.value = theme.value;
+      option.textContent = theme.name;
+      themeSelect.appendChild(option);
+    });
+
+    // 加载保存的主题
+    const savedTheme = GM_getValue('scan_theme', 'matrix');
+    themeSelect.value = savedTheme;
+
+    // 主题切换事件
+    themeSelect.addEventListener('change', function() {
+      GM_setValue('scan_theme', this.value);
+      applyTheme(this.value);
+      showThemeNotification(this.options[this.selectedIndex].text);
+    });
+
+    dragBar.appendChild(themeSelect);
+    scanContainer.appendChild(dragBar);
+
+    // 应用初始主题
+    applyTheme(savedTheme);
+
+    // 注意事项提示
+    const notice = document.createElement('p');
+    notice.textContent = '注意：字典每个路径需要换行，目录扫描很容易崩溃，建议使用小字典千以内。例子：/user';
+    notice.style.fontSize = '14px';
+    notice.style.marginBottom = '20px';
+    notice.style.padding = '8px 12px';
+    notice.style.background = 'linear-gradient(to right, #1E90FF, #FFFFFF)';
+    notice.style.webkitBackgroundClip = 'text';
+    notice.style.backgroundClip = 'text';
+    notice.style.webkitTextFillColor = 'transparent';
+    notice.style.textFillColor = 'transparent';
+    notice.style.borderRadius = '6px';
+    scanContainer.appendChild(notice);
+
+    // 创建检索功能容器
+    const searchContainer = document.createElement('div');
+    searchContainer.style.display = 'flex';
+    searchContainer.style.marginBottom = '15px';
+    searchContainer.style.alignItems = 'center';
+
+    // 创建检索输入框
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.placeholder = '检索扫描结果（支持URL、状态码、标题等）';
+    searchInput.style.width = '100%';
+    searchInput.style.padding = '10px';
+    searchInput.style.border = '1px solid #0F0';
+    searchInput.style.borderRadius = '5px';
+    searchInput.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    searchInput.style.backdropFilter = 'blur(10px)';
+    searchInput.style.color = '#0F0';
+    searchInput.style.fontSize = '14px';
+    
+    // 移除keydown事件监听器，使用input事件实现实时搜索
+    
+    searchContainer.appendChild(searchInput);
+
+
+
+    // 将搜索容器移动到表格视图之前
+    const tableView = scanContainer.querySelector('#table-view');
+    if (tableView) {
+        tableView.parentNode.insertBefore(searchContainer, tableView);
+    } else {
+        scanContainer.appendChild(searchContainer);
+    }
+
+    // 为检索输入框添加事件监听
+    searchInput.addEventListener('input', function() {
+        const searchTerm = searchInput.value.toLowerCase();
+        const rows = document.querySelectorAll('#table-view tr');
+
+        rows.forEach(row => {
+            if (row.cells && row.cells.length > 0) { // 确保是数据行
+                const rowText = Array.from(row.cells).map(cell => cell.textContent.toLowerCase()).join(' ');
+                if (rowText.includes(searchTerm)) {
+                    row.style.display = '';
+                } else {
+                    row.style.display = 'none';
+                }
+            }
+        });
+    });
+
+
+
+    // 导出按钮
+    const exportBtn = document.createElement('button');
+    exportBtn.textContent = '导出数据';
+    exportBtn.style.padding = '12px 25px';
+    exportBtn.style.border = 'none';
+    exportBtn.style.borderRadius = '5px';
+    exportBtn.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    exportBtn.style.backdropFilter = 'blur(10px)';
+    exportBtn.style.color = '#0F0';
+    exportBtn.style.cursor = 'pointer';
+    exportBtn.style.fontSize = '14px';
+    exportBtn.style.fontWeight = 'bold';
+    exportBtn.style.boxShadow = '0 0 10px #0F0';
+    scanContainer.appendChild(exportBtn);
+
+    // POST控件
+    const postRadio = document.createElement('input');
+    postRadio.type = 'radio';
+    postRadio.id = 'post';
+    postRadio.name = 'type';
+    postRadio.value = 'post';
+    const postLabel = document.createElement('label');
+    postLabel.textContent = 'POST';
+    postLabel.setAttribute('for', 'post');
+    postLabel.style.color = '#0F0';
+    postLabel.style.fontSize = '14px';
+    requestTypeDiv.appendChild(postRadio);
+    requestTypeDiv.appendChild(postLabel);
+
+    // 备忘录按钮
+    const memoBtn = document.createElement('button');
+    memoBtn.textContent = '备忘录';
+    memoBtn.style.padding = "12px";
+    memoBtn.style.background = "linear-gradient(45deg, #007bff, #00c4ff)";
+    memoBtn.style.color = "#fff";
+    memoBtn.style.border = "none";
+    memoBtn.style.borderRadius = "8px";
+    memoBtn.style.cursor = "pointer";
+    memoBtn.style.textAlign = "center";
+    memoBtn.style.fontSize = "14px";
+    memoBtn.style.fontWeight = "500";
+    memoBtn.style.transition = "transform 0.2s, box-shadow 0.3s";
+    memoBtn.style.marginLeft = "10px";
+    memoBtn.addEventListener('mouseover', () => {
+        memoBtn.style.transform = "scale(1.05)";
+        memoBtn.style.boxShadow = "0 4px 12px rgba(0, 123, 255, 0.3)";
+    });
+    memoBtn.addEventListener('mouseout', () => {
+        memoBtn.style.transform = "scale(1)";
+        memoBtn.style.boxShadow = "none";
+    });
+    // 将备忘录按钮移动到POST控件后面
+    postLabel.parentNode.insertBefore(memoBtn, postLabel.nextSibling);
+
+    // 备忘录面板
+    const memoPanel = document.createElement('div');
+    memoPanel.style.display = 'none';  // 确保初始状态为不显示
+    memoPanel.style.position = 'fixed';
+    memoPanel.style.top = '50%';
+    memoPanel.style.width = "450px";
+    memoPanel.style.maxHeight = "600px";
+    memoPanel.style.fontFamily = "'Segoe UI', Arial, sans-serif";
+    memoPanel.style.color = "#333";
+    memoPanel.style.background = "linear-gradient(135deg, #ffffff, #f0f4f8)";
+    memoPanel.style.borderRadius = "12px";
+    memoPanel.style.border = "none";
+    memoPanel.style.boxShadow = "0 4px 20px rgba(0, 0, 0, 0.15)";
+    memoPanel.style.left = "20px";
+    memoPanel.style.overflowY = "auto";
+    memoPanel.style.padding = "20px";
+    memoPanel.style.transition = "all 0.3s ease";
+    memoPanel.style.resize = "both";
+    memoPanel.style.minWidth = "300px";
+    memoPanel.style.minHeight = "400px";
+    memoPanel.style.maxWidth = "800px";
+    memoPanel.style.maxHeight = "80vh";
+
+    // 添加标题和关闭按钮
+    const header = document.createElement('div');
+    header.style.display = 'flex';
+    header.style.justifyContent = 'space-between';
+    header.style.alignItems = 'center';
+    header.style.marginBottom = '20px';
+    header.style.cursor = 'move';  // 添加鼠标指针样式
+
+    // 添加拖动功能
+    let isDraggingMemo = false;
+    let memoOffsetX, memoOffsetY;
+
+    header.addEventListener('mousedown', function(e) {
+        isDraggingMemo = true;
+        memoOffsetX = e.clientX - memoPanel.offsetLeft;
+        memoOffsetY = e.clientY - memoPanel.offsetTop;
+        memoPanel.style.cursor = 'grabbing';  // 拖动时改变鼠标样式
+        document.body.style.userSelect = 'none';  // 禁用选择
+    });
+
+    document.addEventListener('mousemove', function(e) {
+        if (isDraggingMemo) {
+            let newLeft = e.clientX - memoOffsetX;
+            let newTop = e.clientY - memoOffsetY;
+
+            // 精确边界检查
+            const panelWidth = memoPanel.offsetWidth;
+            const panelHeight = memoPanel.offsetHeight;
+            const screenWidth = window.innerWidth;
+            const screenHeight = window.innerHeight;
+
+            // 平滑拖动计算
+            newLeft = Math.max(10, Math.min(newLeft, screenWidth - panelWidth - 10));
+            newTop = Math.max(10, Math.min(newTop, screenHeight - panelHeight - 10));
+
+            // 使用requestAnimationFrame实现平滑动画
+            requestAnimationFrame(() => {
+                memoPanel.style.transition = 'none';
+                memoPanel.style.left = newLeft + 'px';
+                memoPanel.style.top = newTop + 'px';
+            });
+        }
+    });
+
+    document.addEventListener('mouseup', function() {
+        isDraggingMemo = false;
+        memoPanel.style.cursor = '';  // 恢复默认鼠标样式
+    });
+
+    const title = document.createElement('h2');
+    title.textContent = '备忘录';
+    title.style.color = '#0F0';
+    title.style.margin = '0';
+    title.style.fontSize = '20px';
+    title.style.fontWeight = 'bold';
+    title.style.lineHeight = '1.5';
+    header.appendChild(title);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '×';
+    closeBtn.style.width = '30px';
+    closeBtn.style.height = '30px';
+    closeBtn.style.padding = '0';
+    closeBtn.style.backgroundColor = 'transparent';
+    closeBtn.style.border = 'none';
+    closeBtn.style.color = '#F00';
+    closeBtn.style.fontSize = '20px';
+    closeBtn.style.cursor = 'pointer';
+    closeBtn.addEventListener('click', () => {
+        memoPanel.style.opacity = '0';
+        memoPanel.style.visibility = 'hidden';
+        setTimeout(() => {
+            memoPanel.style.display = 'none';
+        }, 300);
+    });
+    header.appendChild(closeBtn);
+    memoPanel.appendChild(header);
+
+    document.body.appendChild(memoPanel);
+
+    // 左侧显示区域
+    const memoDisplay = document.createElement('div');
+    memoDisplay.style.overflowY = 'auto';
+    memoPanel.appendChild(memoDisplay);
+
+    // 编辑按钮
+    const editBtn = document.createElement('button');
+    editBtn.textContent = '编辑模式';
+    editBtn.style.padding = '8px 15px';
+    editBtn.style.margin = '10px 0';
+    editBtn.style.border = 'none';
+    editBtn.style.borderRadius = '5px';
+    editBtn.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    editBtn.style.color = '#0F0';
+    editBtn.style.cursor = 'pointer';
+    editBtn.style.fontSize = '14px';
+    editBtn.style.fontWeight = 'bold';
+    editBtn.style.boxShadow = '0 0 5px #0F0';
+    memoDisplay.appendChild(editBtn);
+
+    // 右侧编辑区域
+    const memoEdit = document.createElement('div');
+    memoEdit.style.display = 'none'; // 初始隐藏编辑区域
+    memoEdit.style.visibility = 'hidden'; // 确保完全隐藏
+    memoEdit.style.position = 'absolute';
+    memoEdit.style.left = '-9999px'; // 确保完全隐藏
+    memoEdit.style.opacity = '0'; // 添加透明度设置确保完全隐藏
+    memoPanel.appendChild(memoEdit);
+
+    // 编辑按钮点击事件
+    let isEditMode = false;
+    editBtn.addEventListener('click', () => {
+      isEditMode = !isEditMode;
+      editBtn.textContent = isEditMode ? '预览模式' : '编辑模式';
+      memoEdit.style.display = isEditMode ? 'block' : 'none';
+      memoEdit.style.visibility = isEditMode ? 'visible' : 'hidden';
+      memoEdit.style.opacity = isEditMode ? '1' : '0';
+      memoEdit.style.left = isEditMode ? '0' : '-9999px';
+      memoTitle.style.display = isEditMode ? 'block' : 'none';
+      memoContent.style.display = isEditMode ? 'block' : 'none';
+      memoTitle.disabled = !isEditMode;
+      memoContent.disabled = !isEditMode;
+      saveBtn.style.display = isEditMode ? 'inline-block' : 'none';
+      deleteBtn.style.display = isEditMode ? 'inline-block' : 'none';
+    });
+
+    // 备忘录标题输入框
+    const memoTitle = document.createElement('input');
+    memoTitle.type = 'text';
+    memoTitle.placeholder = '输入标题';
+    memoTitle.disabled = true; // 初始禁用编辑
+    memoTitle.style.width = '100%';
+    memoTitle.style.padding = '10px';
+    memoTitle.style.marginBottom = '10px';
+    memoTitle.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+    memoTitle.style.border = '1px solid #0F0';
+    memoTitle.style.borderRadius = '5px';
+    memoTitle.style.color = '#0F0';
+    memoTitle.style.fontSize = '16px';
+    memoTitle.style.fontWeight = 'normal';
+    memoTitle.style.lineHeight = '1.5';
+    memoPanel.appendChild(memoTitle);
+
+    // 备忘录内容编辑区
+    const memoContent = document.createElement('textarea');
+    memoContent.placeholder = '输入内容';
+    memoContent.disabled = true; // 初始禁用编辑
+    memoContent.style.width = '100%';
+    memoContent.style.height = '300px';
+    memoContent.style.padding = '10px';
+    memoContent.style.marginBottom = '10px';
+    memoContent.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+    memoContent.style.border = '1px solid #0F0';
+    memoContent.style.borderRadius = '5px';
+    memoContent.style.color = '#0F0';
+    memoContent.style.fontSize = '14px';
+    memoContent.style.fontWeight = 'normal';
+    memoContent.style.lineHeight = '1.6';
+    memoContent.style.resize = 'vertical';
+    memoPanel.appendChild(memoContent);
+
+    // 保存按钮
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = '保存';
+    saveBtn.style.padding = '10px 20px';
+    saveBtn.style.marginRight = '10px';
+    saveBtn.style.backgroundColor = 'rgba(0, 255, 0, 0.2)';
+    saveBtn.style.border = '1px solid #0F0';
+    saveBtn.style.borderRadius = '5px';
+    saveBtn.style.color = '#0F0';
+    saveBtn.style.cursor = 'pointer';
+    saveBtn.style.display = 'none'; // 初始隐藏保存按钮
+    memoPanel.appendChild(saveBtn);
+
+    // 删除按钮
+    const deleteBtn = document.createElement('button');
+    deleteBtn.textContent = '删除';
+    deleteBtn.style.padding = '10px 20px';
+    deleteBtn.style.marginLeft = '20px';
+    deleteBtn.style.backgroundColor = 'rgba(255, 0, 0, 0.2)';
+    deleteBtn.style.border = '1px solid #F00';
+    deleteBtn.style.borderRadius = '5px';
+    deleteBtn.style.color = '#F00';
+    deleteBtn.style.cursor = 'pointer';
+    deleteBtn.style.display = 'none'; // 初始隐藏删除按钮
+    memoPanel.appendChild(deleteBtn);
+
+    // 备忘录列表容器移动到左侧显示区域
+    const memoList = document.createElement('div');
+    memoList.style.maxHeight = 'calc(80vh - 40px)';
+    memoList.style.overflowY = 'auto';
+    memoList.style.border = '1px solid #0F03';
+    memoList.style.borderRadius = '5px';
+    memoList.style.padding = '10px';
+    memoDisplay.appendChild(memoList);
+
+    // 加载保存的备忘录
+        // 加载保存的备忘录
+    function loadMemos() {
+        const memos = GM_getValue('memos', []);
+        memoList.innerHTML = '';
+        memos.forEach((memo, index) => {
+            const memoItem = document.createElement('div');
+            memoItem.style.padding = '8px';
+            memoItem.style.marginBottom = '5px';
+            memoItem.style.backgroundColor = 'rgba(0, 255, 0, 0.05)';
+            memoItem.style.borderRadius = '3px';
+            memoItem.style.cursor = 'pointer';
+
+            // 添加标题和内容预览
+            const memoHeader = document.createElement('div');
+            memoHeader.style.display = 'flex';
+            memoHeader.style.justifyContent = 'space-between';
+            memoHeader.style.marginBottom = '5px';
+
+            const memoTitleEl = document.createElement('span');
+            memoTitleEl.textContent = memo.title;
+            memoTitleEl.style.fontWeight = 'bold';
+            memoHeader.appendChild(memoTitleEl);
+
+            const copyBtn = document.createElement('button');
+            copyBtn.textContent = '复制';
+            copyBtn.style.padding = '2px 8px';
+            copyBtn.style.fontSize = '12px';
+            copyBtn.style.backgroundColor = 'rgba(0, 255, 0, 0.1)';
+            copyBtn.style.border = '1px solid #0F0';
+            copyBtn.style.borderRadius = '3px';
+            copyBtn.style.color = '#0F0';
+
+            // 点击复制
+            copyBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                console.log("点击复制按钮");
+                console.log("内容：", memo.content); // 查看memo.content的内容
+
+                if (!memo.content) {
+                    showCopyToast('❌ 复制失败：内容为空!', 'red');
+                } else {
+                    navigator.clipboard.writeText(memo.content).then(() => {
+                        showCopyToast('✔ 复制成功!', 'green');
+                    }).catch((err) => {
+                        showCopyToast('❌ 复制失败：' + err, 'red');
+                    });
+                }
+            });
+
+            memoHeader.appendChild(copyBtn);
+            memoItem.appendChild(memoHeader);
+
+            // 添加内容预览
+            // 添加内容预览
+            const preview = document.createElement('div');
+            preview.textContent = memo.content.length > 50 ?
+                memo.content.substring(0, 50) + '...' : memo.content;
+            preview.style.fontSize = '12px';
+            preview.style.color = '#90EE90';
+            preview.style.opacity = '1';
+            preview.style.whiteSpace = 'nowrap';
+            preview.style.overflow = 'hidden';
+            preview.style.textOverflow = 'ellipsis';
+            memoItem.appendChild(preview);
+
+            memoItem.addEventListener('click', () => {
+                memoTitle.value = memo.title;
+                memoContent.value = memo.content;
+            });
+
+            memoList.appendChild(memoItem);
+        });
+    }
+
+    // 复制成功的 Toast 提示
+    function showCopyToast(message, color = 'rgba(0, 255, 0, 0.8)') {
+        let toast = document.createElement('div');
+        toast.textContent = message;
+        toast.style.position = 'fixed';
+        toast.style.bottom = '50px';
+        toast.style.left = '50%';
+        toast.style.transform = 'translateX(-50%)';
+        toast.style.padding = '10px 20px';
+        toast.style.backgroundColor = color;
+        toast.style.color = '#000';
+        toast.style.fontSize = '14px';
+        toast.style.fontWeight = 'bold';
+        toast.style.borderRadius = '5px';
+        toast.style.boxShadow = '0 0 10px rgba(0, 255, 0, 0.5)';
+        toast.style.zIndex = '9999';
+        toast.style.opacity = '1';
+        toast.style.transition = 'opacity 0.5s ease-out';
+
+        document.body.appendChild(toast);
+
+        // 2 秒后自动淡出并移除
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            setTimeout(() => {
+                document.body.removeChild(toast);
+            }, 500);
+        }, 1500);
+    }
+
+
+    // 保存备忘录
+    saveBtn.addEventListener('click', () => {
+        const title = memoTitle.value.trim();
+        const content = memoContent.value.trim();
+        if (!title || !content) {
+            alert('标题和内容不能为空');
+            return;
+        }
+
+        const memos = GM_getValue('memos', []);
+        memos.push({ title, content });
+        GM_setValue('memos', memos);
+        loadMemos();
+        memoTitle.value = '';
+        memoContent.value = '';
+        alert('保存成功');
+    });
+
+
+    // 删除备忘录
+    deleteBtn.addEventListener('click', () => {
+        const title = memoTitle.value.trim();
+        const content = memoContent.value.trim();
+        if (!title && !content) {
+            alert('请先选择要删除的备忘录');
+            return;
+        }
+
+        const memos = GM_getValue('memos', []);
+        // 查找匹配的备忘录索引
+        const memoIndex = memos.findIndex(memo =>
+            memo.title === title && memo.content === content
+        );
+
+        if (memoIndex === -1) {
+            alert('未找到匹配的备忘录');
+            return;
+        }
+
+        if (confirm(`确定要删除备忘录【${title}】吗？`)) {
+            memos.splice(memoIndex, 1);
+            GM_setValue('memos', memos);
+            loadMemos();
+            memoTitle.value = '';
+            memoContent.value = '';
+            alert('删除成功');
+        }
+    });
+
+
+    // 备忘录按钮点击事件
+    memoBtn.addEventListener('click', () => {
+        if (memoPanel.style.display === 'none') {
+            memoPanel.style.display = 'block';
+            memoPanel.style.opacity = '1';
+            memoPanel.style.visibility = 'visible';
+            loadMemos();
+        } else {
+            memoPanel.style.opacity = '0';
+            memoPanel.style.visibility = 'hidden';
+            setTimeout(() => {
+                memoPanel.style.display = 'none';
+            }, 300);  // 延迟隐藏以配合动画
+        }
+    });
+
+    // 添加 ESC 关闭功能
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && memoPanel.style.display === 'block') {
+            memoPanel.style.opacity = '0';
+            memoPanel.style.visibility = 'hidden';
+            setTimeout(() => {
+                memoPanel.style.display = 'none';
+            }, 300);
+        }
+    });
+
+
+
+    // 请求类型选择
+    const requestTypeDiv = document.createElement('div');
+    requestTypeDiv.style.marginBottom = '15px';
+    const getRadio = document.createElement('input');
+    getRadio.type = 'radio';
+    getRadio.id = 'get';
+    getRadio.name = 'type';
+    getRadio.value = 'get';
+    getRadio.checked = true;
+    const getLabel = document.createElement('label');
+    getLabel.textContent = 'GET';
+    getLabel.setAttribute('for', 'get');
+    getLabel.style.marginRight = '15px';
+    getLabel.style.color = '#0F0';
+    getLabel.style.fontSize = '14px';
+    const postRadio = document.createElement('input');
+    postRadio.type = 'radio';
+    postRadio.id = 'post';
+    postRadio.name = 'type';
+    postRadio.value = 'post';
+    const postLabel = document.createElement('label');
+    postLabel.textContent = 'POST';
+    postLabel.setAttribute('for', 'post');
+    postLabel.style.color = '#0F0';
+    postLabel.style.fontSize = '14px';
+    requestTypeDiv.appendChild(getRadio);
+    requestTypeDiv.appendChild(getLabel);
+    requestTypeDiv.appendChild(postRadio);
+    requestTypeDiv.appendChild(postLabel);
+    scanContainer.appendChild(requestTypeDiv);
+
+    // URL 输入框
+    const urlInput = document.createElement('input');
+    urlInput.placeholder = '需要拼接的 url 例如：http://www.baidu.com/';
+    urlInput.style.width = '100%';
+    urlInput.style.padding = '12px';
+    urlInput.style.marginBottom = '15px';
+    urlInput.style.border = '1px solid #0F0';
+    urlInput.style.borderRadius = '5px';
+    urlInput.value = window.location.origin;
+    urlInput.style.fontSize = '14px';
+    urlInput.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    urlInput.style.backdropFilter = 'blur(10px)';
+    urlInput.style.color = '#0F0';
+    scanContainer.appendChild(urlInput);
+
+    // 字典输入框
+    const dictionaryInput = document.createElement('textarea');
+    dictionaryInput.placeholder = '请输入路径';
+    dictionaryInput.style.width = '100%';
+    dictionaryInput.style.padding = '12px';
+    dictionaryInput.style.marginBottom = '15px';
+    dictionaryInput.style.border = '1px solid #0F0';
+    dictionaryInput.style.borderRadius = '5px';
+    dictionaryInput.style.fontSize = '14px';
+    dictionaryInput.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    dictionaryInput.style.backdropFilter = 'blur(10px)';
+    dictionaryInput.style.color = '#0F0';
+    scanContainer.appendChild(dictionaryInput);
+
+    // POST 参数输入框
+    const postParamsInput = document.createElement('textarea');
+    postParamsInput.placeholder = 'POST 请求数据包（任意格式）';
+    postParamsInput.style.width = '100%';
+    postParamsInput.style.padding = '12px';
+    postParamsInput.style.marginBottom = '15px';
+    postParamsInput.style.border = '1px solid #0F0';
+    postParamsInput.style.borderRadius = '5px';
+    postParamsInput.style.display = 'none';
+    postParamsInput.style.fontSize = '14px';
+    postParamsInput.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    postParamsInput.style.backdropFilter = 'blur(10px)';
+    postParamsInput.style.color = '#0F0';
+    scanContainer.appendChild(postParamsInput);
+
+    // 请求头输入框
+    const headersInput = document.createElement('textarea');
+    headersInput.placeholder = '请求头（类似 Burp 数据包格式，每行一个键值对）';
+    headersInput.style.width = '100%';
+    headersInput.style.padding = '12px';
+    headersInput.style.marginBottom = '15px';
+    headersInput.style.border = '1px solid #0F0';
+    headersInput.style.borderRadius = '5px';
+    headersInput.style.fontSize = '14px';
+    headersInput.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    headersInput.style.backdropFilter = 'blur(10px)';
+    headersInput.style.color = '#0F0';
+    scanContainer.appendChild(headersInput);
+
+    // 执行按钮
+    const executeBtn = document.createElement('button');
+    executeBtn.textContent = '执行';
+    executeBtn.style.padding = '12px 25px';
+    executeBtn.style.border = 'none';
+    executeBtn.style.borderRadius = '5px';
+    executeBtn.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    executeBtn.style.backdropFilter = 'blur(10px)';
+    executeBtn.style.color = '#0F0';
+    executeBtn.style.cursor = 'pointer';
+    executeBtn.style.marginRight = '10px';
+    executeBtn.style.fontSize = '14px';
+    executeBtn.style.fontWeight = 'bold';
+    executeBtn.style.boxShadow = '0 0 10px #0F0';
+    scanContainer.appendChild(executeBtn);
+
+    // 导出按钮
+    const exportBtn = document.createElement('button');
+    exportBtn.textContent = '导出数据';
+    exportBtn.style.padding = '12px 25px';
+    exportBtn.style.border = 'none';
+    exportBtn.style.borderRadius = '5px';
+    exportBtn.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    exportBtn.style.backdropFilter = 'blur(10px)';
+    exportBtn.style.color = '#0F0';
+    exportBtn.style.cursor = 'pointer';
+    exportBtn.style.fontSize = '14px';
+    exportBtn.style.fontWeight = 'bold';
+    exportBtn.style.boxShadow = '0 0 10px #0F0';
+    scanContainer.appendChild(exportBtn);
+
+    // 添加读取本地文件的控件
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.style.padding = '12px 25px';
+    input.style.border = 'none';
+    input.style.borderRadius = '5px';
+    input.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    input.style.backdropFilter = 'blur(10px)';
+    input.style.color = '#0F0';
+    input.style.cursor = 'pointer';
+    input.style.marginLeft = '10px';
+    input.style.fontSize = '14px';
+    input.style.fontWeight = 'bold';
+    input.style.boxShadow = '0 0 10px #0F0';
+    input.onchange = function(e) {
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            console.log('文件内容:', e.target.result);
+            // 可将文件内容追加到字典输入框中
+            dictionaryInput.value += e.target.result;
+        };
+        reader.readAsText(file); // 按文本读取
+    };
+    scanContainer.appendChild(input);
+
+    // 结果表格
+    const resultTable = document.createElement('table');
+    resultTable.style.width = '100%';
+    resultTable.style.borderCollapse = 'collapse';
+    resultTable.style.marginTop = '20px';
+    resultTable.innerHTML = `
+        <thead>
+            <tr>
+                <th style="padding: 12px; border-bottom: 2px solid #0F0; color: #0F0; font-size: 14px; background-color: rgba(0, 0, 0, 0.5); position: relative;">序号</th>
+                <th style="padding: 12px; border-bottom: 2px solid #0F0; color: #0F0; font-size: 14px; background-color: rgba(0, 0, 0, 0.5); position: relative;">url</th>
+                <th style="padding: 12px; border-bottom: 2px solid #0F0; color: #0F0; font-size: 14px; background-color: rgba(0, 0, 0, 0.5); position: relative;">状态码 <span class="sort-icon">↕</span></th>
+                <th style="padding: 12px; border-bottom: 2px solid #0F0; color: #0F0; font-size: 14px; background-color: rgba(0, 0, 0, 0.5); position: relative;">长度 <span class="sort-icon">↕</span></th>
+                <th style="padding: 12px; border-bottom: 2px solid #0F0; color: #0F0; font-size: 14px; background-color: rgba(0, 0, 0, 0.5); position: relative;">标题 <span class="sort-icon">↕</span></th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    `;
+    resultTable.style.overflowX = 'auto';
+    resultTable.style.display = 'block';
+    resultTable.style.maxHeight = '200px';
+    resultTable.style.overflowY = 'auto';
+    scanContainer.appendChild(resultTable);
+
+    // 进度条
+    const progressBar = document.createElement('div');
+    progressBar.style.width = '100%';
+    progressBar.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
+    progressBar.style.backdropFilter = 'blur(10px)';
+    progressBar.style.borderRadius = '5px';
+    progressBar.style.marginTop = '20px';
+    const progress = document.createElement('div');
+    progress.style.width = '0%';
+    progress.style.height = '20px';
+    progress.style.backgroundColor = '#0F0';
+    progress.style.borderRadius = '5px';
+    progressBar.appendChild(progress);
+    scanContainer.appendChild(progressBar);
+
+    // 加载动画
+    const loadingAnimation = document.createElement('div');
+    loadingAnimation.style.display = 'none';
+    loadingAnimation.style.textAlign = 'center';
+    loadingAnimation.style.marginTop = '10px';
+    loadingAnimation.innerHTML = '<div class="spinner"></div>';
+    scanContainer.appendChild(loadingAnimation);
+
+    // 列宽度拖动功能
+    const headers = resultTable.querySelectorAll('th');
+    headers.forEach((header, index) => {
+        if (index < headers.length - 1) {
+            const resizer = document.createElement('div');
+            resizer.classList.add('resizer');
+            resizer.style.position = 'absolute';
+            resizer.style.top = '0';
+            resizer.style.right = '0';
+            resizer.style.width = '5px';
+            resizer.style.height = '100%';
+            resizer.style.cursor = 'col-resize';
+            resizer.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const startWidth = header.offsetWidth;
+                const onMouseMove = (e) => {
+                    const dx = e.clientX - startX;
+                    header.style.width = `${startWidth + dx}px`;
+                };
+                const onMouseUp = () => {
+                    document.removeEventListener('mousemove', onMouseMove);
+                    document.removeEventListener('mouseup', onMouseUp);
+                };
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            });
+            header.appendChild(resizer);
+        }
+    });
+
+    // 确保setElementStyles函数存在
+    function setElementStyles(element, styles) {
+        for (const [key, value] of Object.entries(styles)) {
+            element.style[key] = value;
+        }
+    }
+
+    // 确保adjustPosition函数存在
+    function adjustPosition(panelRect) {
+        const screenWidth = window.innerWidth;
+        const screenHeight = window.innerHeight;
+
+        // X轴修正
+        if (panelRect.right > screenWidth) {
+            panelRect.left -= (panelRect.right - screenWidth + 10);
+        }
+        if (panelRect.left < 0) {
+            panelRect.left = 10;
+        }
+
+        // Y轴修正
+        if (panelRect.bottom > screenHeight) {
+            panelRect.top -= (panelRect.bottom - screenHeight + 10);
+        }
+        if (panelRect.top < 0) {
+            panelRect.top = 10;
+        }
+
+        return panelRect;
+    }
+
+    // 执行扫描函数
+    executeBtn.addEventListener('click', async function () {
+        // 清空表格数据
+        const tbody = resultTable.querySelector('tbody');
+        tbody.innerHTML = '';
+        // 重置进度条
+        progress.style.width = '0%';
+        // 默认隐藏全屏面板和按钮
+        resultPanel.style.display = 'none';
+        fullscreenBtn.style.display = 'none';
+
+        // 执行扫描后，在结果更新时显示面板和按钮
+        const showFullscreenPanel = () => {
+            resultPanel.style.display = 'block';
+            fullscreenBtn.style.display = 'block';
+
+            // 自动调整面板位置
+            const rect = resultPanel.getBoundingClientRect();
+            const adjusted = adjustPosition(rect);
+            resultPanel.style.left = adjusted.left + 'px';
+            resultPanel.style.top = adjusted.top + 'px';
+        };
+
+        // 全屏功能
+        fullscreenBtn.addEventListener('click', function() {
+            if (resultPanel.classList.contains('fullscreen')) {
+                resultPanel.classList.remove('fullscreen');
+                fullscreenBtn.textContent = '全屏';
+                resultPanel.style.width = Math.min(800, window.innerWidth - 40) + 'px';
+                resultPanel.style.height = Math.min(600, window.innerHeight - 40) + 'px';
+                resultPanel.style.left = adjusted.left + 'px';
+                resultPanel.style.top = adjusted.top + 'px';
+            } else {
+                resultPanel.classList.add('fullscreen');
+                fullscreenBtn.textContent = '返回';
+                resultPanel.style.width = '100%';
+                resultPanel.style.height = '100%';
+                resultPanel.style.left = '0';
+                resultPanel.style.top = '0';
+            }
+        });
+
+        // 保存扫描状态到GM存储
+        function saveScanState(state) {
+            GM_setValue('scanState', JSON.stringify(state));
+        }
+
+        // 从GM存储加载扫描状态
+        function loadScanState() {
+            const state = GM_getValue('scanState');
+            return state ? JSON.parse(state) : null;
+        }
+
+        // 在扫描结果处理函数中调用showFullscreenPanel()
+
+        // 添加模态窗口HTML结构（如果不存在）
+        if (!document.getElementById('response-popup')) {
+            const popup = document.createElement('div');
+            popup.id = 'response-popup';
+            popup.style.display = 'none';
+            popup.style.position = 'fixed';
+            popup.style.top = '50%';
+            popup.style.left = '50%';
+            popup.style.transform = 'translate(-50%, -50%)';
+            popup.style.width = '80%';
+            popup.style.maxHeight = '80vh';
+            popup.style.backgroundColor = 'rgba(0, 0, 0, 0.9)';
+            popup.style.border = '1px solid #0F0';
+            popup.style.borderRadius = '8px';
+            popup.style.padding = '20px';
+            popup.style.zIndex = '9999';
+            popup.style.overflow = 'auto';
+            popup.style.boxShadow = '0 0 20px rgba(0, 255, 0, 0.5)';
+            popup.style.fontFamily = 'monospace';
+
+            const closeBtn = document.createElement('button');
+            closeBtn.textContent = '关闭';
+            closeBtn.style.float = 'right';
+
+            // 如果有扫描结果才显示全屏按钮
+            if (tbody.children.length > 0) {
+                fullscreenBtn.style.display = 'block';
+            }
+            closeBtn.style.marginBottom = '10px';
+
+            const pre = document.createElement('pre');
+            pre.style.whiteSpace = 'pre-wrap';
+            pre.style.wordBreak = 'break-word';
+            pre.style.color = '#0F0';
+            pre.style.fontFamily = 'monospace';
+            pre.style.maxHeight = '70vh';
+            pre.style.overflow = 'auto';
+
+            popup.appendChild(closeBtn);
+            popup.appendChild(pre);
+            document.body.appendChild(popup);
+        }
+
+        // 检查URL格式
+        const urlPattern = /^https?:\/\/[^\s/$.?#].[^\s]*$/i;
+        if (!urlPattern.test(urlInput.value)) {
+            const errorDiv = document.createElement('div');
+            errorDiv.style.position = 'fixed';
+            errorDiv.style.top = '50%';
+            errorDiv.style.left = '50%';
+            errorDiv.style.transform = 'translate(-50%, -50%)';
+            errorDiv.style.backgroundColor = 'rgba(0, 0, 0, 0.8)';
+            errorDiv.style.padding = '20px';
+            errorDiv.style.borderRadius = '5px';
+            errorDiv.style.color = '#FF4444';
+            errorDiv.style.fontFamily = 'monospace';
+            errorDiv.style.zIndex = '9999';
+            errorDiv.style.boxShadow = '0 0 15px #FF4444';
+            errorDiv.textContent = '请输入有效的URL（以http://或https://开头）';
+            document.body.appendChild(errorDiv);
+            setTimeout(() => {
+                document.body.removeChild(errorDiv);
+            }, 3000);
+            return;
+        }
+
+        const baseUrl = urlInput.value;
+        let dictionary = dictionaryInput.value.split('\n').map(item => item.trim()).filter(item => item);
+
+
+
+        const requestType = document.querySelector('input[name="type"]:checked').value;
+        const total = dictionary.length;
+        let completed = 0;
+        let results = [];
+
+        loadingAnimation.style.display = 'block';
+
+        const scan = async (dir, index) => {
+            // 当字典为空时直接请求baseUrl
+            const fullUrl = dictionary.length ? `${baseUrl}${dir}` : baseUrl;
+            // 优化请求处理逻辑，例如添加请求缓存机制
+            const requestCache = new Map();
+            const method = requestType === 'get'? 'GET' : 'POST';
+            let headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            };
+            let data = null;
+
+            const headerLines = headersInput.value.split('\n');
+            headerLines.forEach(line => {
+                const colonIndex = line.indexOf(':');
+                if (colonIndex > -1) {
+                    const key = line.slice(0, colonIndex).trim();
+                    const value = line.slice(colonIndex + 1).trim();
+                    headers[key] = value;
+                }
+            });
+
+            if (method === 'POST') {
+                data = postParamsInput.value;
+            }
+
+            const cacheKey = `${method}-${fullUrl}-${JSON.stringify(headers)}-${data}`;
+            if (requestCache.has(cacheKey)) {
+                const cachedResponse = requestCache.get(cacheKey);
+                const responseLength = cachedResponse.responseText? cachedResponse.responseText.length : 0;
+                results.push({
+                    index: index + 1,
+                    url: fullUrl,
+                    status: cachedResponse.status,
+                    length: responseLength,
+                    responseText: cachedResponse.responseText || ''
+                });
+            } else {
+                try {
+                    const response = await new Promise((resolve, reject) => {
+                        GM_xmlhttpRequest({
+                            method: method,
+                            url: fullUrl,
+                            headers: headers,
+                            data: data,
+                            onload: resolve,
+                            onerror: reject
+                        });
+                    });
+                    requestCache.set(cacheKey, response);
+                    const responseLength = response.responseText? response.responseText.length : 0;
+                    results.push({
+                        index: index + 1,
+                        url: fullUrl,
+                        status: response.status,
+                        length: responseLength,
+                        responseText: response.responseText || ''
+                    });
+                } catch (error) {
+                    results.push({
+                        index: index + 1,
+                        url: fullUrl,
+                        status: '请求失败',
+                        length: '',
+                        responseText: '',
+                        errorDetails: error.message || '未知错误'
+                    });
+                    console.error(`请求 ${fullUrl} 失败:`, error);
+                }
+            }
+            completed++;
+            progress.style.width = `${(completed / total) * 100}%`;
+
+            if (completed === total) {
+                // 批量更新表格
+                results.forEach(result => {
+                    const row = document.createElement('tr');
+                    row.style.backgroundColor = 'rgba(0, 0, 0, 0.2)';
+                    row.innerHTML = `
+                        <td style="padding: 10px; border: 1px solid #0F0; color: #000; font-family: monospace;">${result.index}</td>
+                        <td style="padding: 10px; border: 1px solid #0F0; color: #000; font-family: monospace; max-width: 300px; overflow: hidden; text-overflow: ellipsis;">${result.url}</td>
+                        <td style="padding: 10px; border: 1px solid #0F0; color: #000;">${result.status}</td>
+                        <td style="padding: 10px; border: 1px solid #0F0; color: #000;">${result.length}</td>
+                        <td style="padding: 10px; border: 1px solid #0F0; color: #000;">${getTitleFromResponse(result.responseText) || ''}</td>
+                    `;
+                    tbody.appendChild(row);
+                });
+                loadingAnimation.style.display = 'none';
+            }
+        };
+
+        const CONCURRENCY = 100; // 并发数量
+        const runConcurrent = async () => {
+            let index = 0;
+            const queue = [];
+            const results = [];
+
+            while (index < total || queue.length > 0) {
+                // 填充队列
+                while (queue.length < CONCURRENCY && index < total) {
+                    const promise = scan(dictionary[index], index)
+                        .then(result => {
+                            results.push(result);
+                            return result;
+                        });
+                    queue.push(promise);
+                    index++;
+                }
+
+                // 等待最快完成的请求
+                const settled = await Promise.race(queue);
+                queue.splice(queue.indexOf(settled), 1);
+
+                // 批量更新UI，减少DOM操作
+                if (results.length >= 10 || queue.length === 0) {
+                    updateResultsUI(results);
+                    results.length = 0;
+                }
+            }
+        };
+
+        // 批量更新结果到UI
+        const updateResultsUI = (results) => {
+            const fragment = document.createDocumentFragment();
+            results.forEach(result => {
+                if (!result) return;
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td style="padding: 10px; border: 1px solid #0F0; color: #0F0; word-break: break-word;">${result.url}</td>
+                    <td style="padding: 10px; border: 1px solid #0F0; font-size: 13px;"><span class="status-code" data-code="${result.status}" style="color: ${result.status >= 500 ? '#FF0000' : result.status >= 400 ? '#FFA500' : result.status >= 300 ? '#FFFF00' : '#00FF00'}">${result.status}</span></td>
+                    <td style="padding: 10px; border: 1px solid #0F0; color: #0F0;">${result.length}</td>
+                    <td style="padding: 10px; border: 1px solid #0F0; color: #0F0; max-width: 300px; overflow: auto; white-space: pre-wrap; word-break: break-word;">
+                        ${result.responseText && result.responseText.includes('Just a moment...') ? '检测到Cloudflare防护页面' : result.responseText ? result.responseText.replace(/</g, '&lt;').replace(/>/g, '&gt;') : ''}
+                    </td>
+                `;
+                fragment.appendChild(row);
+            });
+            tbody.appendChild(fragment);
+        };
+
+        await runConcurrent();
+    });
+
+    // 导出数据功能（简单示例，实际可优化）
+    exportBtn.addEventListener('click', function () {
+        const rows = resultTable.querySelectorAll('tbody tr');
+        if (rows.length === 0) {
+            const alertBox = document.createElement('div');
+            alertBox.style.position = 'fixed';
+            alertBox.style.top = '50%';
+            alertBox.style.left = '50%';
+            alertBox.style.transform = 'translate(-50%, -50%)';
+            alertBox.style.backgroundColor = 'rgba(0, 0, 0, 0.8)';
+            alertBox.style.padding = '20px';
+            alertBox.style.borderRadius = '5px';
+            alertBox.style.color = '#0F0';
+            alertBox.style.fontFamily = 'monospace';
+            alertBox.style.zIndex = '9999';
+            alertBox.style.boxShadow = '0 0 15px #0F0';
+            alertBox.textContent = '您还没有开始扫描呢';
+            document.body.appendChild(alertBox);
+            setTimeout(() => {
+                document.body.removeChild(alertBox);
+            }, 2000);
+            return;
+        }
+
+        let data = '序号,url,状态码,长度,响应体\n';
+        rows.forEach(row => {
+            const cells = row.querySelectorAll('td');
+            const rowData = Array.from(cells).map(cell => cell.textContent).join(',');
+            data += rowData + '\n';
+        });
+
+        const blob = new Blob([data], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'directory_scan_result.csv';
+        a.click();
+        URL.revokeObjectURL(url);
+    });
+
+    // 加载动画样式
+    const style = document.createElement('style');
+    style.textContent = `
+       .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border-top-color: #0F0;
+            animation: spin 1s ease-in-out infinite;
+            -webkit-animation: spin 1s ease-in-out infinite;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            to { -webkit-transform: rotate(360deg); }
+        }
+        @-webkit-keyframes spin {
+            to { -webkit-transform: rotate(360deg); }
+        }
+       .resizer {
+            background-color: #0F0;
+            opacity: 0.5;
+            transition: opacity 0.2s;
+        }
+       .resizer:hover {
+            opacity: 1;
+        }
+    `;
+    document.head.appendChild(style);
+
+    // 开关按钮点击事件
+    toggleBtn.addEventListener('click', function() {
+        if (scanContainer.style.display === 'none') {
+            scanContainer.style.display = 'block';
+            toggleBtn.textContent = '缩小扫描工具';
+        } else {
+            scanContainer.style.display = 'none';
+            toggleBtn.textContent = '展开扫描工具';
+        }
+    });
+
+    // 根据请求类型显示或隐藏 POST 参数输入框
+    requestTypeDiv.addEventListener('change', function() {
+        if (postRadio.checked) {
+            postParamsInput.style.display = 'block';
+        } else {
+            postParamsInput.style.display = 'none';
+        }
+    });
+
+    // 拖动功能
+    let isDragging = false;
+    let offsetX, offsetY;
+
+    dragBar.addEventListener('mousedown', function(e) {
+        isDragging = true;
+        offsetX = e.clientX - scanContainer.offsetLeft;
+        offsetY = e.clientY - scanContainer.offsetTop;
+    });
+
+    document.addEventListener('mousemove', function(e) {
+        if (isDragging) {
+            // 边界检测
+            let newLeft = e.clientX - offsetX;
+            let newTop = e.clientY - offsetY;
+
+            // 确保不超出视口右侧
+            newLeft = Math.min(newLeft, window.innerWidth - scanContainer.offsetWidth);
+            // 确保不超出视口底部
+            newTop = Math.min(newTop, window.innerHeight - scanContainer.offsetHeight);
+            // 确保不超出视口左侧和顶部
+            newLeft = Math.max(0, newLeft);
+            newTop = Math.max(0, newTop);
+
+            requestAnimationFrame(() => {
+                scanContainer.style.transition = 'none';
+                scanContainer.style.left = newLeft + 'px';
+                scanContainer.style.top = newTop + 'px';
+            });
+        }
+    });
+
+    document.addEventListener('mouseup', function() {
+        isDragging = false;
+        document.body.style.userSelect = '';  // 恢复选择
+    });
+
+    // 添加拖动功能
+    let isDraggingPanel = false;
+    let panelOffsetX, panelOffsetY;
+
+    scanContainer.addEventListener('mousedown', function(e) {
+        isDraggingPanel = true;
+        panelOffsetX = e.clientX - scanContainer.offsetLeft;
+        panelOffsetY = e.clientY - scanContainer.offsetTop;
+        scanContainer.style.cursor = 'grabbing';
+        document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', function(e) {
+        if (isDraggingPanel) {
+            let newLeft = e.clientX - panelOffsetX;
+            let newTop = e.clientY - panelOffsetY;
+
+            // 精确边界检查
+            const containerWidth = scanContainer.offsetWidth;
+            const containerHeight = scanContainer.offsetHeight;
+            const screenWidth = window.innerWidth;
+            const screenHeight = window.innerHeight;
+
+            // 平滑拖动计算
+            newLeft = Math.max(10, Math.min(newLeft, screenWidth - containerWidth - 10));
+            newTop = Math.max(10, Math.min(newTop, screenHeight - containerHeight - 10));
+
+            // 使用setElementStyles保持样式一致性
+            requestAnimationFrame(() => {
+                setElementStyles(scanContainer, {
+                    left: newLeft + 'px',
+                    top: newTop + 'px',
+                    transition: 'all 0.2s ease-out'
+                });
+            });
+        }
+    });
+
+    document.addEventListener('mouseup', function() {
+        isDraggingPanel = false;
+        scanContainer.style.cursor = '';
+        document.body.style.userSelect = '';
+    });
+
+    // 并发控制参数
+    const CONCURRENCY = 100;
+})();
+
+// 改善界面布局，例如添加标题和样式
+const container = document.createElement('div');
+container.style.position = 'fixed';
+container.style.top = '10px';
+container.style.right = '10px';
+container.style.backgroundColor = 'rgba(0, 0, 0, 0.8)';
+container.style.padding = '10px';
+container.style.borderRadius = '5px';
+container.style.color = '#0F0';
+container.style.fontFamily = 'monospace';
+title.style.cursor = 'move';
+container.style.cursor = 'default';
+
+const title = document.createElement('h2');
+title.textContent = '目录扫描工具';
+title.style.marginTop = '0';
+container.appendChild(title);
+
+// 添加拖动功能
+let isDraggingContainer = false;
+let containerOffsetX, containerOffsetY;
+
+document.addEventListener('mousemove', function(e) {
+    if (isDraggingContainer) {
+        let newLeft = e.clientX - containerOffsetX;
+        let newTop = e.clientY - containerOffsetY;
+
+        // 边界检查
+        newLeft = Math.max(0, Math.min(newLeft, window.innerWidth - container.offsetWidth));
+        newTop = Math.max(0, Math.min(newTop, window.innerHeight - container.offsetHeight));
+
+        container.style.left = newLeft + 'px';
+        container.style.top = newTop + 'px';
+    }
+});
+
+document.addEventListener('mouseup', function() {
+    isDraggingContainer = false;
+    container.style.cursor = 'default';
+    title.style.cursor = 'move';
+});
+
+title.addEventListener('mousedown', function(e) {
+    isDraggingContainer = true;
+    containerOffsetX = e.clientX - container.offsetLeft;
+    containerOffsetY = e.clientY - container.offsetTop;
+    container.style.cursor = 'grabbing';
+    title.style.cursor = 'grabbing';
+});
+
+document.addEventListener('mousemove', function(e) {
+    if (isDraggingContainer) {
+        let newLeft = e.clientX - containerOffsetX;
+        let newTop = e.clientY - containerOffsetY;
+
+        // 边界检查
+        newLeft = Math.max(0, Math.min(newLeft, window.innerWidth - container.offsetWidth));
+        newTop = Math.max(0, Math.min(newTop, window.innerHeight - container.offsetHeight));
+
+        container.style.left = newLeft + 'px';
+        container.style.top = newTop + 'px';
+    }
+});
+
+document.addEventListener('mouseup', function() {
+    isDraggingContainer = false;
+    container.style.cursor = '';
+    title.style.cursor = 'move';
+container.style.cursor = 'default';
+});
+
+const form = document.createElement('form');
+container.appendChild(form);
+
+const innerScrollableDiv = document.getElementById('inner-scrollable-div');
+if (innerScrollableDiv) {
+    innerScrollableDiv.style.overflow = 'auto';
+    innerScrollableDiv.style.height = '500px'; // 设置固定高度以便滚动
+}
